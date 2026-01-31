@@ -1,0 +1,25 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# local env
+.env
+.env.*
+!.env.example
+
+# model artifacts / checkpoints
+src/prompt_rl_guess/checkpoints/
+src/prompt_rl_guess/lora_model/
+*.safetensors
+
+# generated outputs / histories
+src/prompt_rl_guess/eval_outputs/
+src/prompt_rl_guess/prompt_history/
+src/prompt_rl_guess/protocol_history/
+
+# OS / editor
+.DS_Store
+.vscode/
