@@ -105,8 +105,8 @@ class GuessNumAgent():
 
     def _parse_llm_message(self, llm_output: str) -> Dict[str, Any]:
         """
-        Parse JSON message from LLM output.
-        Strips any 'think' or reasoning content and keeps only the final JSON.
+        Parse JSON message from LLM output with robust error handling.
+        Strips any 'think' or reasoning content, applies JSON fixes, and uses regex fallback.
         """
         cleaned_output = llm_output.strip()
 
@@ -131,9 +131,7 @@ class GuessNumAgent():
                 cleaned_output = cleaned_output.split(marker, 1)[-1].strip()
 
         # 3 Remove Markdown code blocks (```json ... ```)
-        # 移除开头的 ```json 或 ```JSON
         cleaned_output = re.sub(r'^```(?:json)?\s*', '', cleaned_output, flags=re.IGNORECASE)
-        # 移除结尾的 ```
         cleaned_output = re.sub(r'\s*```$', '', cleaned_output)
 
         # 4 Try direct JSON parsing
@@ -142,20 +140,115 @@ class GuessNumAgent():
         except json.JSONDecodeError:
             pass
 
-        # 4 Fallback: extract the last JSON object in the text
+        # 5 Fallback: extract the last JSON object and attempt auto-repair
         matches = list(re.finditer(r"\{.*?\}", cleaned_output, flags=re.DOTALL))
         if matches:
+            json_candidate = matches[-1].group()
+            
+            # Try parsing the extracted JSON first
             try:
-                return json.loads(matches[-1].group())
+                return json.loads(json_candidate)
             except json.JSONDecodeError:
-                pass
+                # Attempt to fix common JSON syntax errors
+                fixed_json = self._attempt_json_repair(json_candidate)
+                if fixed_json:
+                    try:
+                        return json.loads(fixed_json)
+                    except json.JSONDecodeError:
+                        pass
 
-        # 5 Fail loudly (important for debugging RL / protocol issues)
+        # 6 Last resort: extract 'next_guess' field directly using regex
+        next_guess = self._extract_next_guess_smart(cleaned_output)
+        return {"next_guess": next_guess, "message_content": cleaned_output}
+
+        # 7 Fail loudly with diagnostic info
         raise ValueError(
             "Could not parse final JSON message from LLM output after removing reasoning.\n"
             f"Original output:\n{llm_output}"
             f"\nCleaned output:\n{cleaned_output}"
         )
+
+    def _attempt_json_repair(self, json_str: str) -> Optional[str]:
+        """
+        Attempt to repair common JSON syntax errors.
+        Returns repaired JSON string or None if repair fails.
+        
+        Fixes:
+        - Single quotes to double quotes
+        - Trailing commas
+        - Unquoted strings in values
+        - Extra/missing brackets
+        """
+        repaired = json_str.strip()
+        
+        # 1 Replace single quotes with double quotes (be careful with apostrophes)
+        # Match patterns like 'key' or 'value' (whole word/phrase in quotes)
+        repaired = re.sub(r"'([^']*)'", r'"\1"', repaired)
+        
+        # 2 Remove trailing commas before closing braces/brackets
+        repaired = re.sub(r',(\s*[}\]])', r'\1', repaired)
+        
+        # 3 Fix common unquoted boolean/null values that should be unquoted in JSON
+        # But only if they appear as values (after colon)
+        repaired = re.sub(r':\s*([Tt]rue)', r': true', repaired)
+        repaired = re.sub(r':\s*([Ff]alse)', r': false', repaired)
+        repaired = re.sub(r':\s*([Nn]ull)', r': null', repaired)
+        
+        # 4 Attempt to fix mismatched brackets (count and balance)
+        open_braces = repaired.count('{')
+        close_braces = repaired.count('}')
+        if open_braces > close_braces:
+            repaired += '}' * (open_braces - close_braces)
+        elif close_braces > open_braces:
+            # Remove excess closing braces from the end
+            while repaired.count('}') > repaired.count('{'):
+                repaired = repaired.rstrip('}').rstrip()
+        
+        # 5 Try to escape unescaped quotes within string values
+        # This is tricky, so we use a simple heuristic: escape quotes that aren't already escaped
+        repaired = re.sub(r'(?<!\\)"(\w+)"(?=\s*:)', r'"\1"', repaired)  # Key pattern
+        
+        return repaired
+
+    def _extract_next_guess_smart(self, text: str) -> Optional[int]:
+        """
+        Use regex to extract 'next_guess' value directly from text.
+        Handles various formats, JSON malformations, and null/None values.
+        
+        Looks for patterns like:
+        - "next_guess": 5
+        - "next_guess": "5"  
+        - 'next_guess': 5
+        - next_guess: 5
+        - Also handles: null, None, undefined (returns None)
+        """
+        # First, try to extract numeric values
+        numeric_patterns = [
+            r'["\']?next_guess["\']?\s*:\s*["\']?(\d+)["\']?',
+            r'["\']?next_guess["\']?\s*=\s*["\']?(\d+)["\']?',  # = instead of :
+            r'next_guess["\']?\s*[:\=]\s*["\']?(\d+)',  # More flexible
+        ]
+        
+        for pattern in numeric_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                try:
+                    return int(match.group(1))
+                except (ValueError, IndexError):
+                    continue
+        
+        # Check if next_guess is explicitly set to null/None/undefined
+        null_patterns = [
+            r'["\']?next_guess["\']?\s*[:\=]\s*(null|None|undefined)',
+        ]
+        
+        for pattern in null_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                # Found null/None/undefined, explicitly return None
+                return None
+        
+        return None
 
     def _build_protocol_aware_prompt(self) -> str:
         """

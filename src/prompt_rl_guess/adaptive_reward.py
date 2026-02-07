@@ -26,17 +26,19 @@ import numpy as np
 class RewardConfig:
     """Configuration for adaptive reward system."""
     # Embedding model for semantic evaluation
-    embedding_model: str = "BAAI/bge-small-zh-v1.5"
-    embedding_dim: int = 512
+    # embedding_model: str = "BAAI/bge-small-en-v1.5"
+    # embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    embedding_model: str = "sentence-transformers/all-mpnet-base-v2"
+    embedding_dim: int = 1024
     
     # History buffer for adaptive weight learning
-    history_size: int = 50
+    history_size: int = 100
     
     # Minimum samples before adapting weights
-    warmup_episodes: int = 5
+    warmup_episodes: int = 10
     
     # Learning rate for weight adaptation
-    weight_lr: float = 0.1
+    weight_lr: float = 0.05
     
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -61,46 +63,60 @@ class SemanticEvaluator:
         self._protocol_references = None
         
         # Reference texts that define "good" prompts/protocols
+        # Prompt references: actual instructional content that would appear in generated prompts
         self.prompt_reference_texts = [
-            # Information richness references
-            "The message must include guess_history as a list of all previous guesses",
-            "Include feedback_history showing the result of each guess",
-            "Add eliminated field listing numbers that have been ruled out",
-            "Include remaining_candidates showing possible values",
-            "Add confidence score indicating certainty level",
-            "Provide reasoning explaining the decision logic",
+            # Instructing protocol to include information-rich messages
+            "Design a JSON message schema with the following required fields for agent communication",
+            "Each message must include a guess_history field containing the list of all previous guesses",
+            "Include a feedback_history field showing whether each guess was correct or incorrect",
+            "Add a confidence field indicating the agent's certainty level about its next guess",
+            "Include a reasoning field explaining the logic behind the decision",
             
-            # Interpretation references
-            "Upon receiving a message, update your local state",
-            "Add the other agent's eliminated numbers to your exclusion set",
-            "Use received information to avoid duplicate guesses",
-            "Process incoming messages to update search space",
+            # Instructing how to process messages
+            "Explain how agents should process received messages and update their local state",
+            "Describe the steps for integrating information from other agents",
+            "Specify how agents should use received guess history to avoid redundant attempts",
             
-            # Structure references  
-            "Define a JSON schema with required fields",
-            "Provide example messages showing the format",
-            "Include field descriptions and data types",
+            # Instructing coordination mechanisms
+            "Define which message fields enable effective coordination between agents",
+            "Explain how agents should interpret and utilize each other's confidence scores",
+            "Provide clear rules for making decisions based on aggregated multi-agent information",
+            
+            # Instructing structure and examples
+            "Include at least 5 meaningful fields in the message schema",
+            "Provide example message-response pairs demonstrating how state evolves during coordination",
+            "Show positive examples of well-structured messages that enable successful cooperation",
+            "Show negative examples of poorly-designed messages that hinder coordination",
+            "Describe common mistakes in protocol design and how to avoid them",
         ]
         
+        # Protocol references: actual content that would appear in generated protocols
         self.protocol_reference_texts = [
-            # Rich message structure
-            "guess_history: array of previous guesses",
-            "feedback_history: array of results for each guess",
-            "eliminated: numbers ruled out",
-            "remaining_candidates: possible values",
-            "confidence: float between 0 and 1",
-            "reasoning: explanation of decision",
+            # Message schema definition (what appears in protocol)
+            "Message Schema: guess_history array, feedback_history array, confidence float, reasoning string, next_guess integer",
+            "guess_history: An array of integers representing all previous guesses made by this agent",
+            "feedback_history: An array of booleans indicating whether each guess was correct",
+            "confidence: A float value between 0 and 1 representing certainty about the next guess",
+            "reasoning: A string explaining the logic and inference behind the next guess",
+            "next_guess: An integer representing the agent's next guess within the valid range",
             
-            # Interpretation rules
-            "Upon receiving a message from another agent",
-            "Update your local state based on received information",
-            "Add eliminated numbers to your exclusion set",
-            "Use confidence to adjust your strategy",
+            # Message processing instructions (what appears in protocol)
+            "Upon receiving a message from another agent extract their guess_history and feedback_history",
+            "Add the sender's incorrect guesses to your local exclusion set",
+            "Update your belief about remaining candidates by removing eliminated numbers",
+            "Weight the sender's information by their confidence score when making decisions",
+            "Maintain a combined view of all agents' exploration history",
             
-            # Decision making
-            "Choose next_guess from remaining candidates",
-            "Avoid numbers in eliminated list",
-            "Use aggregated information to decide",
+            # Decision rules (what appears in protocol)
+            "Calculate remaining_candidates by excluding all numbers with false feedback",
+            "Select next_guess from remaining_candidates to maximize information gain",
+            "If multiple agents have high confidence in different numbers avoid guessing the same",
+            "Coordinate to ensure diverse exploration of the search space",
+            
+            # Example exchanges (what appears in protocol)
+            "Example: Agent A sends guess_history=[2,5] feedback_history=[false,false] confidence=0.7 next_guess=3",
+            "Example: Agent B receives this message and excludes 2 and 5 from candidates",
+            "Example showing incorrect message: missing next_guess field causes coordination failure",
         ]
     
     def _load_model(self):
@@ -245,7 +261,7 @@ class AdaptiveWeights(nn.Module):
     based on their correlation with game success.
     """
     
-    def __init__(self, num_components: int = 4, hidden_dim: int = 32):
+    def __init__(self, num_components: int = 3, hidden_dim: int = 32):
         super().__init__()
         self.num_components = num_components
         
@@ -328,7 +344,7 @@ class AdaptiveRewardComputer:
     def __init__(self, config: Optional[RewardConfig] = None):
         self.config = config or RewardConfig()
         self.semantic_evaluator = SemanticEvaluator(self.config)
-        self.adaptive_weights = AdaptiveWeights(num_components=4)
+        self.adaptive_weights = AdaptiveWeights(num_components=3)
         
         # Episode counter for warmup
         self.episode_count = 0
@@ -341,7 +357,6 @@ class AdaptiveRewardComputer:
             "prompt_quality",
             "protocol_quality", 
             "game_success",
-            "length_score"
         ]
     
     def compute_reward(
@@ -374,21 +389,17 @@ class AdaptiveRewardComputer:
         # 3. Game success
         game_success = self._compute_game_success(trajectory)
         
-        # 4. Length score (normalized, no fixed thresholds)
-        length_score = self._compute_adaptive_length_score(prompt)
-        
         # ===== Combine with Adaptive Weights =====
         
         component_scores = {
             "prompt_quality": prompt_score,
             "protocol_quality": protocol_score,
             "game_success": game_success,
-            "length_score": length_score,
         }
         
         # During warmup, use uniform weights
         if self.episode_count <= self.config.warmup_episodes:
-            weights = torch.ones(4) / 4
+            weights = torch.ones(3) / 3
         else:
             scores_tensor = torch.tensor(list(component_scores.values()))
             weights = self.adaptive_weights(scores_tensor)
@@ -413,12 +424,10 @@ class AdaptiveRewardComputer:
             "prompt_quality": prompt_score,
             "protocol_quality": protocol_score,
             "game_success": game_success,
-            "length_score": length_score,
             # Weights (for monitoring)
             "weight_prompt": weights[0].item(),
             "weight_protocol": weights[1].item(),
             "weight_game": weights[2].item(),
-            "weight_length": weights[3].item(),
             # Sub-details
             "prompt_coverage": prompt_details["semantic_coverage"],
             "prompt_similarity": prompt_details["avg_similarity"],
@@ -428,7 +437,6 @@ class AdaptiveRewardComputer:
             "corr_prompt": self.adaptive_weights.correlations[0].item(),
             "corr_protocol": self.adaptive_weights.correlations[1].item(),
             "corr_game": self.adaptive_weights.correlations[2].item(),
-            "corr_length": self.adaptive_weights.correlations[3].item(),
         }
         
         return overall_reward, detailed_scores
@@ -449,43 +457,6 @@ class AdaptiveRewardComputer:
         success_count = sum(1 for r in agent_rewards.values() if r > 0)
         return success_count / max(len(agent_rewards), 1)
     
-    def _compute_adaptive_length_score(self, prompt: str) -> float:
-        """
-        Compute length score adaptively based on historical data.
-        
-        Instead of fixed thresholds, we use the historical distribution
-        to normalize the length score.
-        """
-        current_len = len(prompt)
-        
-        if not hasattr(self, '_length_history'):
-            self._length_history = deque(maxlen=50)
-        
-        self._length_history.append(current_len)
-        
-        if len(self._length_history) < 5:
-            # During warmup, use a simple heuristic
-            # Prefer lengths in 1000-4000 range
-            if current_len < 500:
-                return current_len / 500 * 0.3
-            elif current_len <= 4000:
-                return 0.3 + 0.7 * min(1.0, (current_len - 500) / 3500)
-            else:
-                return max(0.3, 1.0 - (current_len - 4000) / 4000)
-        else:
-            # Use z-score based on history
-            lengths = np.array(list(self._length_history))
-            mean_len = lengths.mean()
-            std_len = lengths.std() + 1e-6
-            
-            # Z-score, clipped to [-2, 2]
-            z = np.clip((current_len - mean_len) / std_len, -2, 2)
-            
-            # Convert to [0, 1] score
-            # Center (z=0) is best, extremes are worse
-            score = 1.0 - abs(z) / 2
-            return float(score)
-    
     def get_baseline(self) -> float:
         """Get adaptive baseline from reward history."""
         if not self.reward_history:
@@ -499,8 +470,7 @@ class AdaptiveRewardComputer:
             f"Adaptive Weights: "
             f"prompt={weights[0]:.3f}, "
             f"protocol={weights[1]:.3f}, "
-            f"game={weights[2]:.3f}, "
-            f"length={weights[3]:.3f}"
+            f"game={weights[2]:.3f}"
         )
 
 

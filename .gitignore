@@ -25,3 +25,4 @@ src/prompt_rl_guess/protocol_history/
 .vscode/
 
 src/llm/config.py
+paper/

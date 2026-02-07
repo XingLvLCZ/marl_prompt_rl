@@ -121,7 +121,10 @@ def main() -> None:
     provider = QwenProvider(api_key=API_KEY, base_url=API_URL, model="Qwen/Qwen3-14B")
     protocol_generator = ProtocolGenerator(provider=provider)
     
-    checkpoint_path = CHECKPOINT_DIR / "prompt_generator_ep20"
+    checkpoint_path = CHECKPOINT_DIR / "prompt_generator_ep10"
+    # no lora
+    # prompt_generator = PromptGenerator(model_name=BASE_MODEL_PATH)
+    # with lora
     prompt_generator = load_prompt_generator(checkpoint_path)
 
     round_summaries: List[Dict[str, object]] = []

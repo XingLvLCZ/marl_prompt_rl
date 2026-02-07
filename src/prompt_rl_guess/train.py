@@ -56,8 +56,8 @@ After each guess, agents can follow a protocol and send a message to others.
 In the game, agents can ONLY know whether their guess is correct or not, and they CANNOT know if their guess is higher or lower than the target number.
 
 Your task:
-Generate a **protocol-generation prompt** that guides a LLM to generate the protocol.
-Reply ONLY the content of the **prompt**.
+**Generate a protocol-generation prompt** that guides a LLM to generate the protocol.
+Reply ONLY the content of the prompt.
 """
 
 prior_knowledge_guidance = """
@@ -66,25 +66,25 @@ prior_knowledge_guidance = """
 A high-quality protocol-generation prompt usually includes the following aspects:
 
 1. The prompt should guide the protocol to define information-rich message:
-- Historical Information such as guess history: a **list** of previous guesses and a **list** of their correctness
+- Historical Information such as guess history: a **list** of previous guesses (int) and a **list** of their correctness (true/false)
 - Belief/Inference such as confidence levels and reasoning
 
 2. The prompt should require the protocol to explain "how to process received messages"
 
-3. Rather than describing general "coordination strategies", focus on:
+3. The prompt focuses on:
 - What specific fields enable coordination
 - How agents should interpret each other's state
 - Example message-response pairs showing state updates
 
-4. A good prompt usually guides LLMs to produce protocols that have:
+4. The prompt guides LLMs to produce protocols that have:
 - Message Schema: JSON structure with 5+ meaningful fields
 - Field Semantics: What each field means and how to populate it
 - Decision Rules: How to use aggregated information to make next guess
 - Example Dialogues: Show message exchanges with state evolution
 
-5. A good prompt usually add explanation in order to control LLMs' behavior.
+5. The prompt provides positive and negative examples of messages to illustrate the desired format and common mistakes to avoid.
 
-6. A good prompt usually provides positive and negative examples of messages to illustrate the desired format and common mistakes to avoid.
+6. The prompt has length approximately around 700 words, balancing detail and conciseness.
 """
 
 hard_constraint = """
@@ -103,7 +103,7 @@ hard_constraint = """
 """
 
 model = prompt_generator.model
-optimizer = AdamW(model.parameters(), lr=1e-4)
+optimizer = AdamW(model.parameters(), lr=5e-5)
 
 # Initialize adaptive reward computer (no external weights needed)
 reward_computer = AdaptiveRewardComputer()
@@ -119,7 +119,7 @@ for ep in range(EPOCHS):
     print("generating prompt...")
     prompt, log_prob = prompt_generator.generate_prompt(
         prompt=task_description + prior_knowledge_guidance,
-        temperature=0.8 - 0.5 * ep / (EPOCHS - 1),  # 从0.8开始，逐渐降到0.3,
+        temperature=0.8 - 0.4 * ep / (EPOCHS - 1),  # 从0.8开始，逐渐降到0.4,
         max_new_tokens=10000
     )
 
@@ -175,8 +175,7 @@ for ep in range(EPOCHS):
         f"[EP {ep + 1}] "
         f"reward={reward:.4f} (game={detailed_scores['game_success']:.4f}, "
         f"protocol={detailed_scores['protocol_quality']:.4f}, "
-        f"prompt_q={detailed_scores['prompt_quality']:.4f}, "
-        f"length={detailed_scores['length_score']:.4f}), "
+        f"prompt_q={detailed_scores['prompt_quality']:.4f}), "
         f"steps={len(trajectory)}, "
         f"loss={loss.item():.4f}, "
         f"log_prob={log_prob.item():.4f}, "
@@ -189,8 +188,7 @@ for ep in range(EPOCHS):
         f"  Adaptive Weights: "
         f"w_prompt={detailed_scores['weight_prompt']:.3f}, "
         f"w_protocol={detailed_scores['weight_protocol']:.3f}, "
-        f"w_game={detailed_scores['weight_game']:.3f}, "
-        f"w_length={detailed_scores['weight_length']:.3f}\n"
+        f"w_game={detailed_scores['weight_game']:.3f}\n"
     )
     
     # Print semantic evaluation details
@@ -205,8 +203,7 @@ for ep in range(EPOCHS):
         f"  Correlations: "
         f"prompt={detailed_scores['corr_prompt']:.3f}, "
         f"protocol={detailed_scores['corr_protocol']:.3f}, "
-        f"game={detailed_scores['corr_game']:.3f}, "
-        f"length={detailed_scores['corr_length']:.3f}\n"
+        f"game={detailed_scores['corr_game']:.3f}\n"
     )
 
     if (ep + 1) % 10 == 0:
@@ -222,7 +219,6 @@ if detailed_scores_history:
     avg_prompt_quality = sum(s['prompt_quality'] for s in detailed_scores_history) / len(detailed_scores_history)
     avg_protocol_quality = sum(s['protocol_quality'] for s in detailed_scores_history) / len(detailed_scores_history)
     avg_game_success = sum(s['game_success'] for s in detailed_scores_history) / len(detailed_scores_history)
-    avg_length_score = sum(s['length_score'] for s in detailed_scores_history) / len(detailed_scores_history)
     
     # Final adaptive weights
     final_weights = detailed_scores_history[-1]
@@ -231,15 +227,12 @@ if detailed_scores_history:
     print(f"Prompt Quality:          {avg_prompt_quality:.4f}")
     print(f"Protocol Quality:        {avg_protocol_quality:.4f}")
     print(f"Game Success Rate:       {avg_game_success:.4f}")
-    print(f"Length Score:            {avg_length_score:.4f}")
     print(f"\n========== FINAL ADAPTIVE WEIGHTS ==========")
     print(f"Weight Prompt:           {final_weights['weight_prompt']:.4f}")
     print(f"Weight Protocol:         {final_weights['weight_protocol']:.4f}")
     print(f"Weight Game:             {final_weights['weight_game']:.4f}")
-    print(f"Weight Length:           {final_weights['weight_length']:.4f}")
     print(f"\n========== LEARNED CORRELATIONS ==========")
     print(f"Corr Prompt→Success:     {final_weights['corr_prompt']:.4f}")
     print(f"Corr Protocol→Success:   {final_weights['corr_protocol']:.4f}")
     print(f"Corr Game→Success:       {final_weights['corr_game']:.4f}")
-    print(f"Corr Length→Success:     {final_weights['corr_length']:.4f}")
     print(f"====================================\n")
