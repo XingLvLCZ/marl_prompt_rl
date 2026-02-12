@@ -65,10 +65,38 @@ class PromptGenerator:
         generated_prompt = self.tokenizer.decode(output_ids[index:], skip_special_tokens=True).strip("\n")
         return generated_prompt
     
+    def _compute_avg_log_prob(self, model, generated_ids: torch.Tensor, prompt_len: int) -> torch.Tensor:
+        """Compute mean log-prob over generated tokens only."""
+        if generated_ids.size(1) <= prompt_len:
+            return torch.tensor(0.0, device=generated_ids.device)
+
+        attention_mask = torch.ones_like(generated_ids, dtype=torch.long)
+
+        outputs = model(
+            input_ids=generated_ids[:, :-1],
+            attention_mask=attention_mask[:, :-1],
+        )
+
+        logits = outputs.logits
+        log_probs = torch.log_softmax(logits, dim=-1)
+
+        token_log_probs = log_probs.gather(
+            dim=-1,
+            index=generated_ids[:, 1:].unsqueeze(-1)
+        ).squeeze(-1)
+
+        # Only keep log-probs for generated tokens (exclude prompt tokens)
+        gen_token_log_probs = token_log_probs[:, prompt_len - 1 :]
+        return gen_token_log_probs.mean()
+
+    def compute_avg_log_prob(self, model, generated_ids: torch.Tensor, prompt_len: int) -> torch.Tensor:
+        """Public helper to compute mean log-prob over generated tokens."""
+        return self._compute_avg_log_prob(model, generated_ids, prompt_len)
+
     def generate_prompt(self, prompt, temperature=0.8, max_new_tokens=1024):
         """
         Generate a prompt using the LoRA-adapted model.
-        Returns (generated_prompt, avg_log_prob) for RL optimization.
+        Returns (generated_prompt, generated_ids, prompt_len, avg_log_prob).
         """
         messages = [{"role": "user", "content": prompt}]
         text = self.tokenizer.apply_chat_template(
@@ -92,36 +120,10 @@ class PromptGenerator:
                 use_cache=True,
             )
 
-        gen_len = generated_ids.size(1)
         prompt_len = attention_mask.size(1)
 
-        generated_attention_mask = torch.ones(
-            (1, gen_len),
-            device=generated_ids.device,
-            dtype=attention_mask.dtype
-        )
-        generated_attention_mask[:, :prompt_len] = attention_mask
-
-        labels = generated_ids[:, 1:].clone()
-        labels[generated_ids[:, 1:] == self.tokenizer.pad_token_id] = -100
-
         self.model.enable_input_require_grads()
-        
-        outputs = self.model(
-            input_ids=generated_ids[:, :-1],
-            attention_mask=generated_attention_mask[:, :-1],
-            labels=labels
-        )
-
-        logits = outputs.logits
-        log_probs = torch.log_softmax(logits, dim=-1)
-
-        token_log_probs = log_probs.gather(
-            dim=-1,
-            index=generated_ids[:, 1:].unsqueeze(-1)
-        ).squeeze(-1)
-
-        avg_log_prob = token_log_probs.mean()
+        avg_log_prob = self._compute_avg_log_prob(self.model, generated_ids, prompt_len)
 
         output_ids = generated_ids[0].tolist()
         try:
@@ -134,7 +136,7 @@ class PromptGenerator:
             skip_special_tokens=True
         ).strip("\n")
 
-        return generated_prompt, avg_log_prob
+        return generated_prompt, generated_ids, prompt_len, avg_log_prob
 
 
 if __name__ == "__main__":
@@ -156,7 +158,11 @@ Generate a **protocol-generation prompt** that guides a LLM to generate the prot
 Reply ONLY the content of the **prompt**.
 """.strip()
 
-    generated_prompt, log_prob = generator.generate_prompt(task_description, temperature=0.3, max_new_tokens=3000)
+    generated_prompt, generated_ids, prompt_len, log_prob = generator.generate_prompt(
+        task_description,
+        temperature=0.3,
+        max_new_tokens=3000
+    )
     
     print("Prompt for Protocol:\n")
     print(generated_prompt)

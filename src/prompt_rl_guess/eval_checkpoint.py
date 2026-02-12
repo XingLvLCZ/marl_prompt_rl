@@ -35,9 +35,9 @@ After each guess, agents can follow a protocol and send a message to others.
 In the game, agents can ONLY know whether their guess is correct or not, and they CANNOT know if their guess is higher or lower than the target number.
 
 Your task:
-Generate a **protocol-generation prompt** that guides a LLM to generate the protocol.
-Reply ONLY the content of the **prompt**.
-""".strip()
+**Generate a protocol-generation prompt** that guides a LLM to generate the protocol.
+Reply ONLY the content of the prompt.
+"""
 
 HARD_CONSTRAINT = """
 ==================== HARD REQUIREMENTS ====================
@@ -121,7 +121,7 @@ def main() -> None:
     provider = QwenProvider(api_key=API_KEY, base_url=API_URL, model="Qwen/Qwen3-14B")
     protocol_generator = ProtocolGenerator(provider=provider)
     
-    checkpoint_path = CHECKPOINT_DIR / "prompt_generator_ep10"
+    checkpoint_path = CHECKPOINT_DIR / "prompt_generator_ep40"
     # no lora
     # prompt_generator = PromptGenerator(model_name=BASE_MODEL_PATH)
     # with lora

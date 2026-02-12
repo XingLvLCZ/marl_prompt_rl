@@ -26,9 +26,8 @@ import numpy as np
 class RewardConfig:
     """Configuration for adaptive reward system."""
     # Embedding model for semantic evaluation
-    # embedding_model: str = "BAAI/bge-small-en-v1.5"
-    # embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
-    embedding_model: str = "sentence-transformers/all-mpnet-base-v2"
+    embedding_model: str = "BAAI/bge-large-en-v1.5"
+    # embedding_model: str = "sentence-transformers/all-mpnet-base-v2"
     embedding_dim: int = 1024
     
     # History buffer for adaptive weight learning
@@ -90,6 +89,36 @@ class SemanticEvaluator:
             "Describe common mistakes in protocol design and how to avoid them",
         ]
         
+        # === Negative references: what BAD prompts look like ===
+        self.prompt_negative_texts = [
+            "Generate a protocol for agents to communicate",
+            "Create a simple message format for the game",
+            "Agents should coordinate and share information",
+            "Design a communication protocol",
+            "Make a JSON format for guessing",
+            "The protocol should be clear and effective",
+        ]
+        
+        # === Negative references: what BAD protocols look like ===
+        self.protocol_negative_texts = [
+            "Send your guess to the other agent",
+            "Message contains the next guess",
+            "Status correct or incorrect",
+            "Attempted list of guessed numbers",
+            "Agents take turns guessing",
+            "The game ends when someone guesses correctly",
+        ]
+        
+        # Negative embeddings (computed lazily)
+        self._prompt_negatives = None
+        self._protocol_negatives = None
+        
+        # Dynamic thresholds (computed from reference statistics)
+        self._prompt_pos_threshold = None
+        self._prompt_neg_threshold = None
+        self._protocol_pos_threshold = None
+        self._protocol_neg_threshold = None
+        
         # Protocol references: actual content that would appear in generated protocols
         self.protocol_reference_texts = [
             # Message schema definition (what appears in protocol)
@@ -149,15 +178,91 @@ class SemanticEvaluator:
         return embeddings
     
     def _ensure_references(self):
-        """Compute reference embeddings if not already done."""
+        """Compute reference embeddings and dynamic thresholds if not already done."""
         if self._prompt_references is None:
             self._prompt_references = self._get_embeddings(self.prompt_reference_texts)
         if self._protocol_references is None:
             self._protocol_references = self._get_embeddings(self.protocol_reference_texts)
+        if self._prompt_negatives is None:
+            self._prompt_negatives = self._get_embeddings(self.prompt_negative_texts)
+        if self._protocol_negatives is None:
+            self._protocol_negatives = self._get_embeddings(self.protocol_negative_texts)
+        
+        # Compute dynamic thresholds once
+        if self._prompt_pos_threshold is None:
+            self._compute_dynamic_thresholds()
+    
+    def _compute_dynamic_thresholds(self):
+        """
+        Compute thresholds dynamically from reference embedding statistics.
+        
+        Positive threshold: derived from within-group pairwise similarity
+          of positive references. A chunk "covers" a reference if its similarity
+          exceeds the average similarity between reference concepts.
+          
+        Negative threshold: derived from cross-group similarity between
+          positive and negative references. Penalize only when similarity
+          to a negative reference is clearly above the positive-negative noise floor.
+        """
+        # --- Prompt thresholds ---
+        prompt_pos_pw = self._pairwise_similarities(self._prompt_references)
+        prompt_cross = self._cross_similarities(self._prompt_references, self._prompt_negatives)
+        
+        # Positive: mean pairwise similarity among positives
+        # A chunk must be at least as similar to a reference as references are to each other
+        prompt_pos_mean = prompt_pos_pw.mean().item()
+        prompt_pos_std = prompt_pos_pw.std().item()
+        self._prompt_pos_threshold = prompt_pos_mean
+        
+        # Negative: cross-group mean + 1.5*std (penalize only clear matches to bad patterns)
+        cross_mean = prompt_cross.mean().item()
+        cross_std = prompt_cross.std().item()
+        self._prompt_neg_threshold = cross_mean + 1.5 * cross_std
+        
+        # --- Protocol thresholds ---
+        proto_pos_pw = self._pairwise_similarities(self._protocol_references)
+        proto_cross = self._cross_similarities(self._protocol_references, self._protocol_negatives)
+        
+        proto_pos_mean = proto_pos_pw.mean().item()
+        proto_pos_std = proto_pos_pw.std().item()
+        self._protocol_pos_threshold = proto_pos_mean
+        
+        proto_cross_mean = proto_cross.mean().item()
+        proto_cross_std = proto_cross.std().item()
+        self._protocol_neg_threshold = proto_cross_mean + 1.5 * proto_cross_std
+        
+        print(f"[Dynamic Thresholds] Prompt:  pos={self._prompt_pos_threshold:.4f}  neg={self._prompt_neg_threshold:.4f}")
+        print(f"[Dynamic Thresholds] Protocol: pos={self._protocol_pos_threshold:.4f}  neg={self._protocol_neg_threshold:.4f}")
+        print(f"  (prompt refs pairwise: mean={prompt_pos_mean:.4f} std={prompt_pos_std:.4f})")
+        print(f"  (protocol refs pairwise: mean={proto_pos_mean:.4f} std={proto_pos_std:.4f})")
+    
+    def _pairwise_similarities(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """Compute upper-triangle pairwise cosine similarities (excluding self-pairs)."""
+        n = embeddings.shape[0]
+        sim_matrix = F.cosine_similarity(
+            embeddings.unsqueeze(1), embeddings.unsqueeze(0), dim=2
+        )
+        # Extract upper triangle (exclude diagonal)
+        mask = torch.triu(torch.ones(n, n, dtype=torch.bool, device=sim_matrix.device), diagonal=1)
+        return sim_matrix[mask]
+    
+    def _cross_similarities(self, emb_a: torch.Tensor, emb_b: torch.Tensor) -> torch.Tensor:
+        """Compute all cross-group cosine similarities between two sets."""
+        # [len_a, len_b]
+        sim_matrix = F.cosine_similarity(
+            emb_a.unsqueeze(1), emb_b.unsqueeze(0), dim=2
+        )
+        return sim_matrix.flatten()
     
     def evaluate_prompt(self, prompt: str) -> Tuple[float, Dict[str, float]]:
         """
         Evaluate prompt quality using semantic similarity to references.
+        
+        Scoring:
+        1. Positive coverage: fraction of references well-matched (dynamic threshold)
+        2. Negative penalty: similarity to known-bad patterns (dynamic threshold)
+        3. Specificity: variance of per-reference similarities
+           High = targeted content (good), Low = vague/generic (bad)
         
         Returns:
             Tuple of (overall_score, component_scores)
@@ -167,66 +272,101 @@ class SemanticEvaluator:
         # Split prompt into chunks for better matching
         chunks = self._split_into_chunks(prompt, max_chunk_size=200)
         if not chunks:
-            return 0.0, {"semantic_coverage": 0.0, "avg_similarity": 0.0}
+            return 0.0, {"semantic_coverage": 0.0, "avg_similarity": 0.0,
+                         "negative_penalty": 0.0, "specificity": 0.0}
         
-        # Get embeddings for prompt chunks
         chunk_embeddings = self._get_embeddings(chunks)
         
-        # Compute similarity matrix: [num_chunks, num_references]
+        # === Positive scoring (dynamic threshold) ===
         similarities = F.cosine_similarity(
-            chunk_embeddings.unsqueeze(1),  # [C, 1, D]
-            self._prompt_references.unsqueeze(0),  # [1, R, D]
+            chunk_embeddings.unsqueeze(1),
+            self._prompt_references.unsqueeze(0),
             dim=2
         )
+        max_sims_per_ref = similarities.max(dim=0).values
         
-        # For each reference, take the max similarity across chunks
-        # This measures "coverage" - how many reference concepts are present
-        max_sims_per_ref = similarities.max(dim=0).values  # [R]
-        
-        # Coverage: fraction of references that have similarity > threshold
-        threshold = 0.5
-        coverage = (max_sims_per_ref > threshold).float().mean().item()
-        
-        # Average similarity: mean of max similarities
+        pos_threshold = self._prompt_pos_threshold
+        coverage = (max_sims_per_ref > pos_threshold).float().mean().item()
         avg_similarity = max_sims_per_ref.mean().item()
         
-        # Overall score combines coverage and similarity
-        overall = 0.6 * coverage + 0.4 * avg_similarity
+        # === Negative penalty (dynamic threshold) ===
+        neg_similarities = F.cosine_similarity(
+            chunk_embeddings.unsqueeze(1),
+            self._prompt_negatives.unsqueeze(0),
+            dim=2
+        )
+        # If any chunk is very similar to a negative reference, penalize
+        max_neg_per_ref = neg_similarities.max(dim=0).values
+        neg_penalty = (max_neg_per_ref > self._prompt_neg_threshold).float().mean().item()
+        
+        # === Specificity: std of per-reference max similarities ===
+        # High std means the prompt specifically addresses some concepts
+        # Low std means the prompt is vaguely similar to everything (generic)
+        specificity_raw = max_sims_per_ref.std().item()
+        # Normalize: typical std range is [0.02, 0.12], map to [0, 1]
+        specificity = min(1.0, specificity_raw / 0.10)
+        
+        # === Combine ===
+        positive_score = 0.4 * coverage + 0.3 * avg_similarity + 0.3 * specificity
+        overall = max(0.0, positive_score - 0.3 * neg_penalty)
         
         return overall, {
             "semantic_coverage": coverage,
             "avg_similarity": avg_similarity,
+            "negative_penalty": neg_penalty,
+            "specificity": specificity,
         }
     
     def evaluate_protocol(self, protocol: str) -> Tuple[float, Dict[str, float]]:
         """
         Evaluate protocol quality using semantic similarity to references.
+        
+        Same structure as prompt evaluation:
+        positive coverage + negative penalty + specificity.
         """
         self._ensure_references()
         
         chunks = self._split_into_chunks(protocol, max_chunk_size=200)
         if not chunks:
-            return 0.0, {"semantic_coverage": 0.0, "avg_similarity": 0.0}
+            return 0.0, {"semantic_coverage": 0.0, "avg_similarity": 0.0,
+                         "negative_penalty": 0.0, "specificity": 0.0}
         
         chunk_embeddings = self._get_embeddings(chunks)
         
+        # === Positive scoring (dynamic threshold) ===
         similarities = F.cosine_similarity(
             chunk_embeddings.unsqueeze(1),
             self._protocol_references.unsqueeze(0),
             dim=2
         )
-        
         max_sims_per_ref = similarities.max(dim=0).values
         
-        threshold = 0.5
-        coverage = (max_sims_per_ref > threshold).float().mean().item()
+        pos_threshold = self._protocol_pos_threshold
+        coverage = (max_sims_per_ref > pos_threshold).float().mean().item()
         avg_similarity = max_sims_per_ref.mean().item()
         
-        overall = 0.6 * coverage + 0.4 * avg_similarity
+        # === Negative penalty (dynamic threshold) ===
+        neg_similarities = F.cosine_similarity(
+            chunk_embeddings.unsqueeze(1),
+            self._protocol_negatives.unsqueeze(0),
+            dim=2
+        )
+        max_neg_per_ref = neg_similarities.max(dim=0).values
+        neg_penalty = (max_neg_per_ref > self._protocol_neg_threshold).float().mean().item()
+        
+        # === Specificity: std of per-reference max similarities ===
+        specificity_raw = max_sims_per_ref.std().item()
+        specificity = min(1.0, specificity_raw / 0.10)
+        
+        # === Combine ===
+        positive_score = 0.4 * coverage + 0.3 * avg_similarity + 0.3 * specificity
+        overall = max(0.0, positive_score - 0.3 * neg_penalty)
         
         return overall, {
             "semantic_coverage": coverage,
             "avg_similarity": avg_similarity,
+            "negative_penalty": neg_penalty,
+            "specificity": specificity,
         }
     
     def _split_into_chunks(self, text: str, max_chunk_size: int = 200) -> List[str]:
@@ -431,8 +571,12 @@ class AdaptiveRewardComputer:
             # Sub-details
             "prompt_coverage": prompt_details["semantic_coverage"],
             "prompt_similarity": prompt_details["avg_similarity"],
+            "prompt_neg_penalty": prompt_details["negative_penalty"],
+            "prompt_specificity": prompt_details["specificity"],
             "protocol_coverage": protocol_details["semantic_coverage"],
             "protocol_similarity": protocol_details["avg_similarity"],
+            "protocol_neg_penalty": protocol_details["negative_penalty"],
+            "protocol_specificity": protocol_details["specificity"],
             # Correlation estimates
             "corr_prompt": self.adaptive_weights.correlations[0].item(),
             "corr_protocol": self.adaptive_weights.correlations[1].item(),
@@ -497,3 +641,27 @@ def compute_adaptive_reward(
         reward_computer = AdaptiveRewardComputer()
     
     return reward_computer.compute_reward(trajectory, protocol, prompt)
+
+
+if __name__ == "__main__":
+    # 初始化奖励计算器
+    reward_computer = AdaptiveRewardComputer()
+
+    # 构造一个简单的测试数据
+    trajectory = [
+        {"agent": "A", "reward": 1.0},
+        {"agent": "B", "reward": 0.0},
+        {"agent": "C", "reward": 1.0},
+    ]
+    protocol = "Message Schema: guess_history, feedback_history, confidence, reasoning, next_guess"
+    prompt = "Design a JSON message schema with required fields for agent communication"
+
+    # 计算奖励
+    reward, details = reward_computer.compute_reward(trajectory, protocol, prompt)
+
+    # 打印结果
+    print("=== Test Run ===")
+    print(f"Reward: {reward:.4f}")
+    print("Details:")
+    for k, v in details.items():
+        print(f"  {k}: {v}")

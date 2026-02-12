@@ -1,5 +1,8 @@
+import copy
+from collections import deque
 import torch
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
 from src.prompt_rl_guess.guess_agent import GuessNumAgent
 from src.prompt_rl_guess.generator import PromptGenerator
 from src.prompt_rl_guess.adaptive_reward import AdaptiveRewardComputer
@@ -87,6 +90,65 @@ A high-quality protocol-generation prompt usually includes the following aspects
 6. The prompt has length approximately around 700 words, balancing detail and conciseness.
 """
 
+# Prior annealing: progressively summarize prior knowledge over training.
+# Stages are defined as fractions of total epochs and mapped to prompt variants.
+def build_prior_variants(full_prior: str):
+    stripped = "\n".join(line.rstrip() for line in full_prior.strip().splitlines())
+    brief = """
+==================== DESIGN PRINCIPLES (PRIOR KNOWLEDGE) ====================
+
+A strong **protocol-generation prompt** should:
+
+1. Direct the protocol to define rich messages:
+   - Past guesses and correctness  
+   - Confidence levels and reasoning  
+
+2. Instruct the protocol on how to process received messages.
+
+3. Emphasize:
+   - Fields that enable coordination  
+   - How agents interpret each other's state
+   - Example message-response pairs  
+
+4. Guide outputs to include:
+   - JSON schema with meaningful fields  
+   - Clear field semantics  
+   - Decision rules for next guesses  
+   - Example dialogues showing state changes  
+
+5. Provide positive and negative examples to show correct format and common errors.
+
+6. Be the sufficient and suitable length, balancing detail and clarity.
+""".strip()
+    compact = """
+==================== DESIGN PRINCIPLES (PRIOR KNOWLEDGE) ====================
+
+A well-designed **protocol-generation prompt** should do the following to guide protocol-generation:
+
+- Emphasize creating messages that are informative and interpretable  
+- Require clarity on how communication is processed and coordinated  
+- Encourage structured outputs with meaningful fields and rules  
+- Include illustrative examples to guide correct formatting  
+- Balance detail with conciseness
+""".strip()
+    return {
+        "full": stripped,
+        "brief": brief,
+        "compact": compact,
+        "none": "",
+    }
+
+def pick_prior_stage(ep: int, total_epochs: int):
+    # Fractional schedule: full -> brief -> compact -> none
+    progress = (ep + 1) / max(1, total_epochs)
+    if progress <= 0.25:
+        return "full"
+    if progress <= 0.50:
+        return "brief"
+    if progress <= 0.75:
+        return "compact"
+    return "none"
+
 hard_constraint = """
 ==================== HARD REQUIREMENTS ====================
 
@@ -103,29 +165,65 @@ hard_constraint = """
 """
 
 model = prompt_generator.model
-optimizer = AdamW(model.parameters(), lr=5e-5)
+
+# LoRA-friendly learning rate schedule: warmup then cosine decay.
+BASE_LR = 5e-5
+MIN_LR = 1e-5
+WARMUP_RATIO = 0.1
+
+optimizer = AdamW(model.parameters(), lr=BASE_LR)
 
 # Initialize adaptive reward computer (no external weights needed)
 reward_computer = AdaptiveRewardComputer()
 
-baseline = 0.0
 rewards = []
 detailed_scores_history = []
-EPOCHS = 30
+EPOCHS = 80
+REF_UPDATE_INTERVAL = 10
+KL_BETA = 0.1
+reward_window = deque(maxlen=20)
+
+warmup_epochs = max(1, int(EPOCHS * WARMUP_RATIO))
+
+def lr_lambda(ep: int):
+    if ep < warmup_epochs:
+        return (ep + 1) / warmup_epochs
+    progress = (ep - warmup_epochs) / max(1, (EPOCHS - warmup_epochs))
+    cosine = 0.5 * (1.0 + torch.cos(torch.tensor(progress * 3.14159265)))
+    return float((MIN_LR / BASE_LR) + (1.0 - MIN_LR / BASE_LR) * cosine)
+
+scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+prior_variants = build_prior_variants(prior_knowledge_guidance)
+
+# Create a slow-moving reference model for KL regularization
+ref_model = copy.deepcopy(prompt_generator.model)
+ref_model.eval()
+for param in ref_model.parameters():
+    param.requires_grad_(False)
 
 for ep in range(EPOCHS):
     print("=" * 10 + f" Episode {ep+1}/{EPOCHS} " + "=" * 10)
     
     print("generating prompt...")
-    prompt, log_prob = prompt_generator.generate_prompt(
-        prompt=task_description + prior_knowledge_guidance,
+    prior_stage = pick_prior_stage(ep, EPOCHS)
+    prior_text = prior_variants[prior_stage]
+    if prior_text:
+        full_task_prompt = task_description + "\n\n" + prior_text
+    else:
+        full_task_prompt = task_description
+    prompt, generated_ids, prompt_len, avg_log_prob = prompt_generator.generate_prompt(
+        prompt=full_task_prompt,
         temperature=0.8 - 0.4 * ep / (EPOCHS - 1),  # 从0.8开始，逐渐降到0.4,
-        max_new_tokens=10000
+        max_new_tokens=7000
     )
 
     with open(f"src/prompt_rl_guess/prompt_history/prompt_{ep+1}.md", "w") as f:
         f.write(prompt)
-    print(f"Prompt (len={len(prompt)}) saved at src/prompt_rl_guess/prompt_history/prompt_{ep+1}.md")
+    print(
+        f"Prompt (len={len(prompt)}) saved at src/prompt_rl_guess/prompt_history/prompt_{ep+1}.md "
+        f"[prior_stage={prior_stage}]"
+    )
 
     full_prompt = prompt + "\n\n" + hard_constraint
 
@@ -156,18 +254,32 @@ for ep in range(EPOCHS):
     detailed_scores_history.append(detailed_scores)
 
     reward_tensor = torch.tensor(reward, dtype=torch.float32, device=model.device)
+
+    with torch.no_grad():
+        ref_avg_log_prob = prompt_generator.compute_avg_log_prob(
+            ref_model,
+            generated_ids,
+            prompt_len
+        )
     
-    advantage = reward_tensor - baseline
-    baseline = 0.9 * baseline + 0.1 * reward
+    # Reward whitening using a sliding window of past rewards
+    if len(reward_window) >= 2:
+        window_mean = sum(reward_window) / len(reward_window)
+        window_var = sum((r - window_mean) ** 2 for r in reward_window) / (len(reward_window) - 1)
+        reward_std = (window_var + 1e-8) ** 0.5
+    else:
+        window_mean = reward
+        reward_std = 1.0
+    advantage = (reward_tensor - window_mean) / reward_std
+    reward_window.append(reward)
     
-    loss = -log_prob * advantage.detach()
+    kl_div = avg_log_prob - ref_avg_log_prob
+    loss = -(avg_log_prob * advantage.detach()) + KL_BETA * kl_div
     
     optimizer.zero_grad()
     loss.backward()
-    
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-    
     optimizer.step()
+    scheduler.step()
     
     torch.cuda.empty_cache()
     
@@ -178,9 +290,12 @@ for ep in range(EPOCHS):
         f"prompt_q={detailed_scores['prompt_quality']:.4f}), "
         f"steps={len(trajectory)}, "
         f"loss={loss.item():.4f}, "
-        f"log_prob={log_prob.item():.4f}, "
+        f"log_prob={avg_log_prob.item():.4f}, "
+        f"kl={kl_div.item():.4f}, "
         f"advantage={advantage.item():.4f}, "
-        f"baseline={baseline:.4f}\n"
+        f"window_mean={window_mean:.4f}, "
+        f"window_std={reward_std:.4f}, "
+        f"lr={scheduler.get_last_lr()[0]:.6f}\n"
     )
     
     # Print adaptive weights (learned, not fixed)
@@ -209,6 +324,10 @@ for ep in range(EPOCHS):
     if (ep + 1) % 10 == 0:
         model.save_pretrained(f"src/prompt_rl_guess/checkpoints/prompt_generator_ep{ep+1}")
         print(f"LoRA adapter saved at episode {ep+1}\n")
+
+    if (ep + 1) % REF_UPDATE_INTERVAL == 0:
+        ref_model.load_state_dict(prompt_generator.model.state_dict())
+        print(f"Reference model synced at episode {ep + 1}\n")
 
 print(f"\nTraining completed!")
 print(f"Average reward over {len(rewards)} episodes: {sum(rewards)/len(rewards):.4f}")
