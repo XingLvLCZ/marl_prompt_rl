@@ -56,20 +56,12 @@ class ProtocolGenerator:
         if match:
             cleaned = match.group(1).strip()
 
-        # 3️⃣ Final sanity check: must be Markdown
-        # if not cleaned.startswith("#"):
-        #     raise ValueError(
-        #         "Extracted content does not appear to be a valid Markdown protocol.\n"
-        #         f"Raw output:\n{llm_output}\n"
-        #         f"Cleaned output:\n{cleaned}"
-        #     )
-
         return cleaned
 
 
 if __name__ == "__main__":
-    from src.llm.deepseek import DeepSeekProvider
-    from src.llm.config import API_KEY, API_URL
+    from src.provider.deepseek import DeepSeekProvider
+    from src.provider.config import API_KEY, API_URL
 
     provider = DeepSeekProvider(api_key=API_KEY, base_url=API_URL, model="deepseek-ai/DeepSeek-V3.1")
     generator = ProtocolGenerator(provider)

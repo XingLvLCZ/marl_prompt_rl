@@ -13,16 +13,21 @@ __pycache__/
 # model artifacts / checkpoints
 src/prompt_rl_guess/checkpoints/
 src/prompt_rl_guess/lora_model/
+src/prompt_rl_autogen/checkpoints/
+src/prompt_rl_autogen/lora_model/
 *.safetensors
 
 # generated outputs / histories
 src/prompt_rl_guess/eval_outputs/
 src/prompt_rl_guess/prompt_history/
 src/prompt_rl_guess/protocol_history/
+src/prompt_rl_autogen/eval_outputs
+src/prompt_rl_autogen/prompt_history
+src/prompt_rl_autogen/protocol_history
 
 # OS / editor
 .DS_Store
 .vscode/
 
-src/llm/config.py
+src/provider/config.py
 paper/

@@ -64,6 +64,11 @@ class SemanticEvaluator:
         # Reference texts that define "good" prompts/protocols
         # Prompt references: actual instructional content that would appear in generated prompts
         self.prompt_reference_texts = [
+            # role instructions for protocol generation (what appears in prompt)
+            "You are an expert that generates protocols for multi-agent coordination games.",
+            "Your task is to generate a protocol that enables agents to effectively coordinate and communicate in a guessing game.",
+            "The protocol must be clear, actionable, and enable agents to make informed decisions based on shared information.",
+
             # Instructing protocol to include information-rich messages
             "Design a JSON message schema with the following required fields for agent communication",
             "Each message must include a guess_history field containing the list of all previous guesses",
@@ -397,8 +402,17 @@ class AdaptiveWeights(nn.Module):
     """
     Learn optimal weights for combining reward components.
     
-    Uses attention mechanism to dynamically weight different components
-    based on their correlation with game success.
+    Uses causal chain correlation + entropy-aware temperature to dynamically
+    weight components while preventing collapse onto any single signal.
+    
+    Causal chain: prompt → protocol → game_success
+    - prompt weight  ∝ corr(prompt, protocol)   — upstream causal influence
+    - protocol weight ∝ corr(protocol, game)     — downstream causal influence
+    - game weight    ∝ corr(game, prompt)        — feedback loop signal
+    
+    This avoids corr(game, game) ≡ 1.0 which would always dominate.
+    Entropy-aware temperature prevents any single correlation from collapsing
+    the weight distribution.
     """
     
     def __init__(self, num_components: int = 3, hidden_dim: int = 32):
@@ -413,65 +427,87 @@ class AdaptiveWeights(nn.Module):
         # Context vector for attention
         self.context = nn.Parameter(torch.randn(hidden_dim) * 0.1)
         
-        # History for correlation-based adaptation
+        # History for causal correlation computation
         self.score_history = deque(maxlen=50)
-        self.success_history = deque(maxlen=50)
         
-        # Running correlation estimates
+        # Running causal correlation estimates (initialized uniform)
         self.correlations = torch.ones(num_components) / num_components
     
     def forward(self, component_scores: torch.Tensor) -> torch.Tensor:
         """
-        Compute adaptive weights using attention.
+        Compute adaptive weights using attention + entropy-aware temperature.
         
-        Args:
-            component_scores: [batch, num_components] tensor of raw scores
-            
-        Returns:
-            weights: [num_components] tensor of normalized weights
+        Temperature adapts based on the entropy of the weight distribution:
+        - Low entropy (concentrated) → higher temperature → spread out weights
+        - High entropy (uniform) → temperature ≈ 1 → trust the learned distribution
+        
+        Temperature range is [1, 2], derived from the entropy ratio ∈ [0, 1],
+        so no magic numbers are introduced.
         """
-        # Attention scores
+        # Raw attention scores
         attn_scores = torch.matmul(self.component_embeddings, self.context)
         
-        # Incorporate correlation prior
+        # Incorporate causal correlation prior
         attn_scores = attn_scores + self.correlations.to(attn_scores.device)
         
-        # Softmax to get weights
-        weights = F.softmax(attn_scores, dim=0)
+        # Entropy-aware temperature: prevents weight collapse
+        with torch.no_grad():
+            raw_weights = F.softmax(attn_scores, dim=0)
+            entropy = -(raw_weights * torch.log(raw_weights + 1e-8)).sum()
+            max_entropy = torch.log(torch.tensor(float(self.num_components)))
+            # concentration ∈ [0, 1]: 0 = uniform, 1 = fully concentrated
+            concentration = (1.0 - entropy / max_entropy).clamp(0, 1).item()
+            # temperature ∈ [1, 2]: higher when concentrated
+            temperature = 1.0 + concentration
+        
+        weights = F.softmax(attn_scores / temperature, dim=0)
         
         return weights
     
     def update_correlations(self, component_scores: Dict[str, float], game_success: float):
         """
-        Update correlation estimates based on new episode data.
+        Update correlation estimates using CAUSAL CHAIN correlations.
+        
+        Instead of correlating every component with game_success
+        (which gives corr(game, game) ≡ 1.0 and causes game to dominate),
+        we measure correlations along the causal chain:
+        
+            prompt → protocol → game → (feedback to prompt)
+        
+        Each component's importance = its causal influence on the NEXT
+        component in the chain.
         """
         scores = list(component_scores.values())[:self.num_components]
         self.score_history.append(scores)
-        self.success_history.append(game_success)
         
         if len(self.score_history) >= 10:
-            # Compute correlations
             scores_array = np.array(list(self.score_history))
-            success_array = np.array(list(self.success_history))
             
-            new_corrs = []
-            for i in range(min(self.num_components, scores_array.shape[1])):
-                if np.std(scores_array[:, i]) > 1e-6 and np.std(success_array) > 1e-6:
-                    corr = np.corrcoef(scores_array[:, i], success_array)[0, 1]
-                    corr = 0.0 if np.isnan(corr) else corr
-                else:
-                    corr = 0.0
-                new_corrs.append(max(0.0, corr))  # Only positive correlations
+            prompt_scores = scores_array[:, 0]
+            protocol_scores = scores_array[:, 1]
+            game_scores = scores_array[:, 2]
+            
+            def safe_corr(a, b):
+                if np.std(a) > 1e-6 and np.std(b) > 1e-6:
+                    c = np.corrcoef(a, b)[0, 1]
+                    return 0.0 if np.isnan(c) else c
+                return 0.0
+            
+            # Causal chain correlations
+            causal_corrs = np.array([
+                max(0.0, safe_corr(prompt_scores, protocol_scores)),   # prompt → protocol
+                max(0.0, safe_corr(protocol_scores, game_scores)),     # protocol → game
+                max(0.0, safe_corr(game_scores, prompt_scores)),       # game → prompt (feedback)
+            ])
             
             # Normalize
-            new_corrs = np.array(new_corrs)
-            if new_corrs.sum() > 0:
-                new_corrs = new_corrs / new_corrs.sum()
+            if causal_corrs.sum() > 0:
+                causal_corrs = causal_corrs / causal_corrs.sum()
             else:
-                new_corrs = np.ones(self.num_components) / self.num_components
+                causal_corrs = np.ones(self.num_components) / self.num_components
             
             # Exponential moving average update
-            self.correlations = 0.9 * self.correlations + 0.1 * torch.tensor(new_corrs, dtype=torch.float32)
+            self.correlations = 0.9 * self.correlations + 0.1 * torch.tensor(causal_corrs, dtype=torch.float32)
 
 
 class AdaptiveRewardComputer:
@@ -577,10 +613,10 @@ class AdaptiveRewardComputer:
             "protocol_similarity": protocol_details["avg_similarity"],
             "protocol_neg_penalty": protocol_details["negative_penalty"],
             "protocol_specificity": protocol_details["specificity"],
-            # Correlation estimates
-            "corr_prompt": self.adaptive_weights.correlations[0].item(),
-            "corr_protocol": self.adaptive_weights.correlations[1].item(),
-            "corr_game": self.adaptive_weights.correlations[2].item(),
+            # Causal chain correlation estimates
+            "causal_prompt_proto": self.adaptive_weights.correlations[0].item(),
+            "causal_proto_game": self.adaptive_weights.correlations[1].item(),
+            "causal_game_prompt": self.adaptive_weights.correlations[2].item(),
         }
         
         return overall_reward, detailed_scores
@@ -609,12 +645,12 @@ class AdaptiveRewardComputer:
     
     def get_summary(self) -> str:
         """Get summary of current adaptive state."""
-        weights = self.adaptive_weights.correlations.numpy()
+        corrs = self.adaptive_weights.correlations.numpy()
         return (
-            f"Adaptive Weights: "
-            f"prompt={weights[0]:.3f}, "
-            f"protocol={weights[1]:.3f}, "
-            f"game={weights[2]:.3f}"
+            f"Causal Correlations: "
+            f"prompt→proto={corrs[0]:.3f}, "
+            f"proto→game={corrs[1]:.3f}, "
+            f"game→prompt={corrs[2]:.3f}"
         )
 
 

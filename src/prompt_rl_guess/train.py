@@ -1,28 +1,41 @@
 import copy
 from collections import deque
+import random
 import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from src.prompt_rl_guess.guess_agent import GuessNumAgent
-from src.prompt_rl_guess.generator import PromptGenerator
-from src.prompt_rl_guess.adaptive_reward import AdaptiveRewardComputer
+from src.generator.qwen3_prompt_generator import PromptGenerator
+from src.prompt_rl_guess.adaptive_reward import AdaptiveRewardComputer, RewardConfig
 from src.prompt_rl_guess.pz_guess_env import GuessGamePettingZooEnv
 from src.prompt_rl_guess.pz_guess_runner import GuessGameRunner
-from src.protocol.generator import ProtocolGenerator
-from src.protocol.loader import ProtocolLoader
-from src.llm.qwen import QwenProvider
-from src.llm.config import API_KEY, API_URL
+from src.generator.protocol_generator import ProtocolGenerator
+from src.generator.protocol_loader import ProtocolLoader
+from src.provider.qwen import QwenProvider
+from src.provider.config import API_KEY, API_URL
 
 
 NUM_CHOICES = 10
 NUM_AGENTS = 2
-MAX_STEPS = 10
-TARGET_NUMBER = 4
+MAX_STEPS = 20
+
+
+def _pick_devices():
+    """Single-process multi-GPU split.
+
+    - Main trainable prompt generator lives on cuda:0
+    - Reference model (for KL) + reward embedding model live on cuda:1 (if available)
+    """
+    if not torch.cuda.is_available():
+        return "cpu", "cpu"
+    if torch.cuda.device_count() >= 2:
+        return "cuda:0", "cuda:1"
+    return "cuda:0", "cuda:0"
 
 def run_episode(protocol: str, agent_provider):
     agents = {
         f"agent_{i}": GuessNumAgent(
-            agent_id="agent_0",
+            agent_id=f"agent_{i}",
             provider=agent_provider,
             protocol=protocol,
             initial_guess=0,
@@ -38,11 +51,19 @@ def run_episode(protocol: str, agent_provider):
         env=env,
         agents=agents
     )
-    trajectory = runner.run_episode(target=TARGET_NUMBER)
+    current_target = random.randint(0, NUM_CHOICES - 1)
+    print(f"  Target number for this episode: {current_target}")
+    trajectory = runner.run_episode(target=current_target)
     return trajectory
 
+train_device, aux_device = _pick_devices()
+
+# Keep the trainable model on a single GPU to make backward/optimizer behavior predictable.
+# The second GPU (if present) is used for the frozen reference model and reward embedding model.
 prompt_generator = PromptGenerator(
     model_name="/root/aicloud-data/llms/Qwen3-1.7B",
+    device_map={"": 0} if train_device.startswith("cuda") else None,
+    use_gradient_checkpointing=True,
 )
 provider = QwenProvider(api_key=API_KEY, base_url=API_URL, model="Qwen/Qwen3-14B")
 protocol_generator = ProtocolGenerator(provider=provider)
@@ -88,6 +109,8 @@ A high-quality protocol-generation prompt usually includes the following aspects
 5. The prompt provides positive and negative examples of messages to illustrate the desired format and common mistakes to avoid.
 
 6. The prompt has length approximately around 700 words, balancing detail and conciseness.
+
+7. The prompt can give LLMs appropriate roles to play when generating the protocol, such as "You are an expert that generates protocols for multi-agent coordination games."
 """
 
 # Prior annealing: progressively summarize prior knowledge over training.
@@ -141,11 +164,11 @@ A well-designed **protocol-generation prompt** should do the following to guide 
 def pick_prior_stage(ep: int, total_epochs: int):
     # Fractional schedule: full -> brief -> compact -> none
     progress = (ep + 1) / max(1, total_epochs)
-    if progress <= 0.25:
+    if progress <= 0.30:
         return "full"
-    if progress <= 0.50:
+    if progress <= 0.60:
         return "brief"
-    if progress <= 0.75:
+    if progress <= 0.80:
         return "compact"
     return "none"
 
@@ -167,21 +190,32 @@ hard_constraint = """
 model = prompt_generator.model
 
 # LoRA-friendly learning rate schedule: warmup then cosine decay.
-BASE_LR = 5e-5
+BASE_LR = 3e-5
 MIN_LR = 1e-5
-WARMUP_RATIO = 0.1
+WARMUP_RATIO = 0.15
 
 optimizer = AdamW(model.parameters(), lr=BASE_LR)
 
-# Initialize adaptive reward computer (no external weights needed)
-reward_computer = AdaptiveRewardComputer()
+# Initialize adaptive reward computer (keep embedding model off the main training GPU when possible)
+reward_device = aux_device if aux_device != train_device else train_device
+reward_computer = AdaptiveRewardComputer(config=RewardConfig(device=reward_device))
 
 rewards = []
 detailed_scores_history = []
-EPOCHS = 80
-REF_UPDATE_INTERVAL = 10
-KL_BETA = 0.1
+EPOCHS = 100
+REF_UPDATE_INTERVAL = 20
 reward_window = deque(maxlen=20)
+
+# 在训练循环之前初始化 EMA 参数
+ema_mean = 0.0
+ema_var = 1.0   # 初始方差不能为0
+alpha = 7/(EPOCHS+1)     # 平滑因子，可根据总迭代次数调整（例如 0.05）
+
+# ---------- 初始化自适应 KL ----------
+KL_BETA = 0.1
+TARGET_KL = 0.01
+BETA_MIN = 1e-4
+BETA_MAX = 1.0
 
 warmup_epochs = max(1, int(EPOCHS * WARMUP_RATIO))
 
@@ -202,6 +236,10 @@ ref_model.eval()
 for param in ref_model.parameters():
     param.requires_grad_(False)
 
+# If a second GPU exists, keep the frozen reference model there to reduce peak VRAM on the trainable GPU.
+if aux_device != train_device:
+    ref_model = ref_model.to(aux_device)
+
 for ep in range(EPOCHS):
     print("=" * 10 + f" Episode {ep+1}/{EPOCHS} " + "=" * 10)
     
@@ -214,7 +252,7 @@ for ep in range(EPOCHS):
         full_task_prompt = task_description
     prompt, generated_ids, prompt_len, avg_log_prob = prompt_generator.generate_prompt(
         prompt=full_task_prompt,
-        temperature=0.8 - 0.4 * ep / (EPOCHS - 1),  # 从0.8开始，逐渐降到0.4,
+        temperature=0.7,
         max_new_tokens=7000
     )
 
@@ -253,27 +291,39 @@ for ep in range(EPOCHS):
     rewards.append(reward)
     detailed_scores_history.append(detailed_scores)
 
-    reward_tensor = torch.tensor(reward, dtype=torch.float32, device=model.device)
+    reward_tensor = torch.tensor(reward, dtype=torch.float32, device=avg_log_prob.device)
 
     with torch.no_grad():
-        ref_avg_log_prob = prompt_generator.compute_avg_log_prob(
-            ref_model,
-            generated_ids,
-            prompt_len
-        )
+        generated_ids_ref = generated_ids.to(next(ref_model.parameters()).device)
+        ref_avg_log_prob = prompt_generator.compute_avg_log_prob(ref_model, generated_ids_ref, prompt_len)
     
-    # Reward whitening using a sliding window of past rewards
-    if len(reward_window) >= 2:
-        window_mean = sum(reward_window) / len(reward_window)
-        window_var = sum((r - window_mean) ** 2 for r in reward_window) / (len(reward_window) - 1)
-        reward_std = (window_var + 1e-8) ** 0.5
-    else:
-        window_mean = reward
-        reward_std = 1.0
-    advantage = (reward_tensor - window_mean) / reward_std
-    reward_window.append(reward)
+    # # Reward whitening using a sliding window of past rewards
+    # if len(reward_window) >= 2:
+    #     window_mean = sum(reward_window) / len(reward_window)
+    #     window_var = sum((r - window_mean) ** 2 for r in reward_window) / (len(reward_window) - 1)
+    #     reward_std = (window_var + 1e-8) ** 0.5
+    # else:
+    #     window_mean = reward
+    #     reward_std = 1.0
+    # advantage = (reward_tensor - window_mean) / reward_std
+    # reward_window.append(reward)
+
+    # 更新 EMA 均值和方差（Welford 在线算法，使用 α 平滑）
+    # 均值更新
+    delta = reward - ema_mean
+    ema_mean = ema_mean + alpha * delta
+    # 方差更新（无偏估计的 EMA 版本）
+    ema_var = (1 - alpha) * (ema_var + alpha * delta**2)
+    reward_std = (ema_var + 1e-8) ** 0.5
+    # 计算优势
+    advantage = (reward_tensor - ema_mean) / reward_std
     
     kl_div = avg_log_prob - ref_avg_log_prob
+    # 自适应 KL 惩罚
+    if kl_div.item() > TARGET_KL * 1.5:
+        KL_BETA = min(KL_BETA * 1.2, BETA_MAX)
+    elif kl_div.item() < TARGET_KL / 1.5:
+        KL_BETA = max(KL_BETA / 1.2, BETA_MIN)
     loss = -(avg_log_prob * advantage.detach()) + KL_BETA * kl_div
     
     optimizer.zero_grad()
@@ -293,8 +343,8 @@ for ep in range(EPOCHS):
         f"log_prob={avg_log_prob.item():.4f}, "
         f"kl={kl_div.item():.4f}, "
         f"advantage={advantage.item():.4f}, "
-        f"window_mean={window_mean:.4f}, "
-        f"window_std={reward_std:.4f}, "
+        f"ema_mean={ema_mean:.4f}, "
+        f"ema_std={reward_std:.4f}, "
         f"lr={scheduler.get_last_lr()[0]:.6f}\n"
     )
     
@@ -313,12 +363,12 @@ for ep in range(EPOCHS):
         f"protocol[cov={detailed_scores['protocol_coverage']:.3f}, sim={detailed_scores['protocol_similarity']:.3f}]\n"
     )
     
-    # Print correlation estimates (how each component relates to game success)
+    # Print causal chain correlation estimates
     print(
-        f"  Correlations: "
-        f"prompt={detailed_scores['corr_prompt']:.3f}, "
-        f"protocol={detailed_scores['corr_protocol']:.3f}, "
-        f"game={detailed_scores['corr_game']:.3f}\n"
+        f"  Causal Chain: "
+        f"prompt\u2192proto={detailed_scores['causal_prompt_proto']:.3f}, "
+        f"proto\u2192game={detailed_scores['causal_proto_game']:.3f}, "
+        f"game\u2192prompt={detailed_scores['causal_game_prompt']:.3f}\n"
     )
 
     if (ep + 1) % 10 == 0:
@@ -350,8 +400,8 @@ if detailed_scores_history:
     print(f"Weight Prompt:           {final_weights['weight_prompt']:.4f}")
     print(f"Weight Protocol:         {final_weights['weight_protocol']:.4f}")
     print(f"Weight Game:             {final_weights['weight_game']:.4f}")
-    print(f"\n========== LEARNED CORRELATIONS ==========")
-    print(f"Corr Prompt→Success:     {final_weights['corr_prompt']:.4f}")
-    print(f"Corr Protocol→Success:   {final_weights['corr_protocol']:.4f}")
-    print(f"Corr Game→Success:       {final_weights['corr_game']:.4f}")
+    print(f"\n========== CAUSAL CHAIN CORRELATIONS ==========")
+    print(f"Prompt \u2192 Protocol:     {final_weights['causal_prompt_proto']:.4f}")
+    print(f"Protocol \u2192 Game:       {final_weights['causal_proto_game']:.4f}")
+    print(f"Game \u2192 Prompt:         {final_weights['causal_game_prompt']:.4f}")
     print(f"====================================\n")

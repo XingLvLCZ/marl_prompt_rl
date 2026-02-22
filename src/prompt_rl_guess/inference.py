@@ -2,7 +2,7 @@
 LoRA Inference Helper - 使用已训练的LoRA adapter进行推理
 """
 import torch
-from src.prompt_rl_guess.generator import PromptGenerator
+from src.generator.qwen3_prompt_generator import PromptGenerator
 
 
 def load_lora_adapter(adapter_path: str, base_model: str = "/root/aicloud-data/llms/Qwen3-1.7B"):

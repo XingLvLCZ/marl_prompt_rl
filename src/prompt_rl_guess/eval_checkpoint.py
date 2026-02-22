@@ -7,12 +7,12 @@ import torch
 
 from src.prompt_rl_guess.guess_agent import GuessNumAgent
 from src.prompt_rl_guess.pz_guess_env import GuessGamePettingZooEnv
-from src.llm.config import API_KEY, API_URL
-from src.llm.qwen import QwenProvider
-from src.prompt_rl_guess.generator import PromptGenerator
+from src.provider.config import API_KEY, API_URL
+from src.provider.qwen import QwenProvider
+from src.generator.qwen3_prompt_generator import PromptGenerator
 from src.prompt_rl_guess.pz_guess_runner import GuessGameRunner
-from src.protocol.generator import ProtocolGenerator
-from src.protocol.loader import ProtocolLoader
+from src.generator.protocol_generator import ProtocolGenerator
+from src.generator.protocol_loader import ProtocolLoader
 
 
 BASE_MODEL_PATH = "/root/aicloud-data/llms/Qwen3-1.7B"
@@ -20,7 +20,7 @@ CHECKPOINT_DIR = Path("src/prompt_rl_guess/checkpoints")
 EVAL_OUTPUT_DIR = Path("src/prompt_rl_guess/eval_outputs")
 NUM_CHOICES = 10
 NUM_AGENTS = 2
-MAX_STEPS = 10
+MAX_STEPS = 20
 ROUNDS = 3
 
 TASK_DESCRIPTION = f"""
@@ -121,7 +121,7 @@ def main() -> None:
     provider = QwenProvider(api_key=API_KEY, base_url=API_URL, model="Qwen/Qwen3-14B")
     protocol_generator = ProtocolGenerator(provider=provider)
     
-    checkpoint_path = CHECKPOINT_DIR / "prompt_generator_ep40"
+    checkpoint_path = CHECKPOINT_DIR / "prompt_generator_ep70"
     # no lora
     # prompt_generator = PromptGenerator(model_name=BASE_MODEL_PATH)
     # with lora

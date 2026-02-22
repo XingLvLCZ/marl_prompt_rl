@@ -1,8 +1,8 @@
 from src.prompt_rl_guess.pz_guess_env import GuessGamePettingZooEnv
 from src.prompt_rl_guess.pz_guess_runner import GuessGameRunner
 from src.prompt_rl_guess.guess_agent import GuessNumAgent
-from src.llm.qwen import QwenProvider
-from src.llm.config import API_KEY, API_URL
+from src.provider.qwen import QwenProvider
+from src.provider.config import API_KEY, API_URL
 
 # =========================
 # 1. Agent & Protocol

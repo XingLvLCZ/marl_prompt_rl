@@ -1,5 +1,5 @@
 import http.client
-from src.llm.config import API_KEY
+from src.provider.config import API_KEY
 
 # 创建 HTTPS 连接（注意：http.client 不接受 URL 协议前缀）
 conn = http.client.HTTPConnection("172.21.15.28", 80)
