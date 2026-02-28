@@ -42,11 +42,14 @@ def infer_prompt(
 
 
 if __name__ == "__main__":
+    # generator = load_lora_adapter(adapter_path="", base_model=INFER_BASE_MODEL)
+    # output = infer_prompt(generator)
+    # print(output)
+    # with open("inference_base_model.md", "w") as f:
+    #     f.write(output)
+
     generator = load_lora_adapter(adapter_path=INFER_ADAPTER_PATH, base_model=INFER_BASE_MODEL)
     output = infer_prompt(generator)
     print(output)
-
-    import torch
-    
-    peak = torch.cuda.max_memory_allocated()
-    print(f"Peak GPU memory: {peak / 1024**2:.2f} MB")
+    with open("inference_rl_model.md", "w") as f:
+        f.write(output)

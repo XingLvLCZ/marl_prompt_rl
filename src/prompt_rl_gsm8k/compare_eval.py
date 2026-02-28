@@ -21,8 +21,7 @@ from src.prompt_rl_gsm8k.autogen_env import AutoGenEpisodeEnv, AutoGenEpisodeRes
 from src.prompt_rl_gsm8k.config import AutoGenDatasetConfig, AutoGenTask
 from src.prompt_rl_gsm8k.prompt_template import build_protocol_generation_prompt
 from src.prompt_rl_gsm8k.task_dataset import load_tasks
-from src.provider.config import API_KEY, API_URL
-from src.provider.qwen import QwenProvider
+from src.provider.local import LocalProvider
 
 
 COMPARE_BASE_MODEL_PATH = "/root/models/Qwen3-4B-Instruct-2507"
@@ -31,6 +30,8 @@ COMPARE_RL_ADAPTER_PATH = "src/prompt_rl_gsm8k/checkpoints_trl/checkpoint-700"
 COMPARE_PROTOCOL_MODEL = "Qwen/Qwen3-14B"
 COMPARE_ENV_MODEL = "Qwen/Qwen3-14B"
 COMPARE_SINGLE_SOLVER_MODEL = "Qwen/Qwen3-14B"
+COMPARE_LOCAL_BASE_URL = "http://localhost:8000/v1"
+COMPARE_LOCAL_API_KEY = "EMPTY"
 
 COMPARE_MAX_ROUNDS = 9
 COMPARE_ENV_TEMPERATURE = 0.2
@@ -38,7 +39,7 @@ COMPARE_ENV_TEMPERATURE = 0.2
 COMPARE_DATASET_HF_PATH = "/root/datasets/gsm8k"
 COMPARE_DATASET_HF_NAME = "main"
 COMPARE_DATASET_SPLIT = "test"
-COMPARE_TASK_LIMIT = 300
+COMPARE_TASK_LIMIT = 100
 COMPARE_TASK_SHUFFLE = False
 COMPARE_SEED = 42
 
@@ -58,6 +59,8 @@ class CompareConfig:
     protocol_model: str
     env_model: str
     single_solver_model: str
+    local_base_url: str
+    local_api_key: str
     max_rounds: int
     env_temperature: float
     dataset_hf_path: str
@@ -92,6 +95,8 @@ def _build_config() -> CompareConfig:
         protocol_model=COMPARE_PROTOCOL_MODEL,
         env_model=COMPARE_ENV_MODEL,
         single_solver_model=COMPARE_SINGLE_SOLVER_MODEL,
+        local_base_url=COMPARE_LOCAL_BASE_URL,
+        local_api_key=COMPARE_LOCAL_API_KEY,
         max_rounds=COMPARE_MAX_ROUNDS,
         env_temperature=COMPARE_ENV_TEMPERATURE,
         dataset_hf_path=COMPARE_DATASET_HF_PATH,
@@ -186,8 +191,14 @@ def _generate_prompt_rl_model(base_model_path: str, adapter_path: str) -> str:
     return out
 
 
-def _generate_protocol(protocol_model: str, generated_prompt: str, out_dir: Path) -> str:
-    provider = QwenProvider(api_key=API_KEY, base_url=API_URL, model=protocol_model)
+def _generate_protocol(
+    protocol_model: str,
+    generated_prompt: str,
+    out_dir: Path,
+    local_base_url: str,
+    local_api_key: str,
+) -> str:
+    provider = LocalProvider(api_key=local_api_key, base_url=local_base_url, model=protocol_model)
     protocol_generator = ProtocolGenerator(provider=provider)
     protocol_path = protocol_generator.generate_protocol(
         prompt=generated_prompt,
@@ -197,7 +208,7 @@ def _generate_protocol(protocol_model: str, generated_prompt: str, out_dir: Path
     return protocol_path.read_text(encoding="utf-8")
 
 
-def _single_model_answer(provider: QwenProvider, question: str) -> str:
+def _single_model_answer(provider: LocalProvider, question: str) -> str:
     user_prompt = (
         "You are solving a GSM8K math word problem. "
         "Solve it carefully and output your final answer in one line with this exact format: "
@@ -224,7 +235,7 @@ def _compute_row_from_result(
 
 
 def _evaluate_single_model(cfg: CompareConfig, tasks: list[AutoGenTask], out_dir: Path) -> list[TaskEvalRow]:
-    provider = QwenProvider(api_key=API_KEY, base_url=API_URL, model=cfg.single_solver_model)
+    provider = LocalProvider(api_key=cfg.local_api_key, base_url=cfg.local_base_url, model=cfg.single_solver_model)
 
     rows: list[TaskEvalRow] = []
     total = len(tasks)
@@ -308,8 +319,8 @@ def _evaluate_multi_agent(
 ) -> list[TaskEvalRow]:
     env = AutoGenEpisodeEnv(
         model=cfg.env_model,
-        api_key=API_KEY,
-        base_url=API_URL,
+        api_key=cfg.local_api_key,
+        base_url=cfg.local_base_url,
         max_rounds=cfg.max_rounds,
         temperature=cfg.env_temperature,
         strategist_name=cfg.strategist_name,
@@ -583,7 +594,13 @@ def run_comparison_eval() -> None:
     print("\n[2/3] Multi-agent with base prompt generator (no RL adapter)", flush=True)
     base_generated_prompt = _generate_prompt_base_model(cfg.base_model_path)
     (dirs["multi_agent_base"] / "generated_prompt.md").write_text(base_generated_prompt, encoding="utf-8")
-    base_protocol = _generate_protocol(cfg.protocol_model, base_generated_prompt, dirs["multi_agent_base"])
+    base_protocol = _generate_protocol(
+        cfg.protocol_model,
+        base_generated_prompt,
+        dirs["multi_agent_base"],
+        cfg.local_base_url,
+        cfg.local_api_key,
+    )
     (dirs["multi_agent_base"] / "generated_protocol.md").write_text(base_protocol, encoding="utf-8")
     base_rows = _evaluate_multi_agent(
         cfg=cfg,
@@ -599,7 +616,13 @@ def run_comparison_eval() -> None:
     print("\n[3/3] Multi-agent with RL-optimized prompt generator", flush=True)
     rl_generated_prompt = _generate_prompt_rl_model(cfg.base_model_path, cfg.rl_adapter_path)
     (dirs["multi_agent_rl"] / "generated_prompt.md").write_text(rl_generated_prompt, encoding="utf-8")
-    rl_protocol = _generate_protocol(cfg.protocol_model, rl_generated_prompt, dirs["multi_agent_rl"])
+    rl_protocol = _generate_protocol(
+        cfg.protocol_model,
+        rl_generated_prompt,
+        dirs["multi_agent_rl"],
+        cfg.local_base_url,
+        cfg.local_api_key,
+    )
     (dirs["multi_agent_rl"] / "generated_protocol.md").write_text(rl_protocol, encoding="utf-8")
     rl_rows = _evaluate_multi_agent(
         cfg=cfg,

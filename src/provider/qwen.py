@@ -12,7 +12,7 @@ class QwenProvider:
             base_url: API基础URL（可选，默认为本地地址）
         """
         self.api_key = api_key
-        self.base_url = base_url or 'https://localhost:8000/v1/chat/completions'
+        self.base_url = base_url + '/chat/completions' if base_url else 'https://localhost:8000/v1/chat/completions'
         self.model = model
         
     def call(self, 
@@ -91,8 +91,8 @@ if __name__ == "__main__":
     print(f"Response 1: \n{response1}")
     
     # # 方式2: 使用call方法
-    # response2 = provider.call("what is Qwen?")
-    # print(f"Response 2: \n{response2}")
+    response2 = provider.call("what is Qwen?")
+    print(f"Response 2: \n{response2}")
     
     # # 方式3: 使用完整的消息列表
     # messages = [
