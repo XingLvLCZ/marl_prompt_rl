@@ -13,17 +13,23 @@ __pycache__/
 # model artifacts / checkpoints
 src/prompt_rl_guess/checkpoints/
 src/prompt_rl_guess/lora_model/
-src/prompt_rl_autogen/checkpoints/
-src/prompt_rl_autogen/lora_model/
+src/prompt_rl_gsm8k/*checkpoints*/
+src/prompt_rl_gsm8k/lora_model/
+src/prompt_rl_multiagentbench/checkpoints/
 *.safetensors
 
 # generated outputs / histories
 src/prompt_rl_guess/eval_outputs/
 src/prompt_rl_guess/prompt_history/
 src/prompt_rl_guess/protocol_history/
-src/prompt_rl_autogen/eval_outputs
-src/prompt_rl_autogen/prompt_history
-src/prompt_rl_autogen/protocol_history
+src/prompt_rl_gsm8k/*eval_outputs
+src/prompt_rl_gsm8k/*prompt_history
+src/prompt_rl_gsm8k/*protocol_history
+src/prompt_rl_gsm8k/compare_outputs/
+src/prompt_rl_multiagentbench/eval_outputs/
+src/prompt_rl_multiagentbench/prompt_history/
+src/prompt_rl_multiagentbench/protocol_history/
+src/prompt_rl_multiagentbench/runtime/
 
 # OS / editor
 .DS_Store

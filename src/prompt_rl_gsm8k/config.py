@@ -6,7 +6,27 @@ from typing import List
 class AutoGenModelConfig:
     model: str = "Qwen/Qwen3-14B"
     temperature: float = 0.2
-    max_rounds: int = 6
+    max_rounds: int = 9
+    strategist_name: str = "strategist"
+    calculator_name: str = "calculator"
+    verifier_name: str = "verifier"
+
+
+@dataclass
+class AutoGenDatasetConfig:
+    source: str = "hf"
+    local_path: str = ""
+    hf_path: str = ""
+    hf_name: str = ""
+    hf_split: str = "train"
+    task_id_field: str = "task_id"
+    prompt_field: str = "prompt"
+    answer_field: str = "expected_answer"
+    task_type: str = "generic"  # generic/gsm8k
+    limit: int = 0
+    shuffle: bool = False
+    seed: int = 42
+    train_ratio: float = 0.8
 
 
 @dataclass

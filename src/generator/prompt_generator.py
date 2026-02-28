@@ -6,7 +6,7 @@ from typing import Any
 class PromptGenerator:
     def __init__(
         self,
-        model_name="/root/aicloud-data/llms/Qwen3-4B-Instruct-2507",
+        model_name="/root/models/Qwen3-4B-Instruct-2507",
         adapter_path=None,
         lora_config=None,
         device_map: Any = "auto",
@@ -55,7 +55,6 @@ class PromptGenerator:
     def generate_prompt_without_log_prob(self, prompt):
         """Inference-only generation without log probabilities."""
         messages = [{"role": "user", "content": prompt}]
-        # Nanbeige 使用标准的 ChatML 格式，移除 Qwen 特有的 enable_thinking 参数
         text = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -151,17 +150,46 @@ class PromptGenerator:
 
 
 if __name__ == "__main__":
-    generator = PromptGenerator(model_name="/root/aicloud-data/llms/Qwen3-4B-Instruct-2507")  # 如果已下载到本地，替换为本地路径
+    generator = PromptGenerator(model_name="/root/models/Qwen3-4B-Instruct-2507", use_gradient_checkpointing=True)  # 如果已下载到本地，替换为本地路径
 
     task_description = f"""
-Task target:
-- task_id: arith_1
-- collaborative_problem: Solve collaboratively. Compute (17 * 6) + 25. The final responder must output exactly: FINAL_ANSWER: <value>.
+Dataset overview:
+- task_family: GSM8K-style grade-school arithmetic word problems
+- objective: maximize final answer correctness under limited interaction rounds
+- constraints: communication should be informative, adaptive, and concise
+
+Agent architecture:
+- strategist: decomposes the problem, proposes solution plan, tracks unresolved subgoals
+- calculator: performs arithmetic operations and returns explicit equation steps
+- verifier: validates consistency, checks unit/logic errors, decides when to emit final answer
 
 Your task:
-Generate a protocol-generation prompt that will guide another LLM to produce a collaboration protocol for AutoGen multi-agent problem solving.
-DO NOT solve the problem or give the final answer yourself in the prompt. Focus on designing a high-quality prompt.
-OUTPUT ONLY the prompt content.
+Generate a high-quality protocol-generation prompt that guides another LLM to produce an effective collaboration protocol.
+The generated prompt should emphasize adaptive communication quality over rigid formatting constraints.
+
+## Extra information
+<DESIGN PRINCIPLES (PRIOR KNOWLEDGE) START>
+
+You are optimizing the quality of a protocol-generation prompt, not directly writing the protocol.
+The goal is to produce a prompt that can reliably induce a high-quality collaboration protocol on GSM8K.
+
+Guidance:
+- Focus on what makes a prompt induce better collaborative behavior.
+- Encourage role specialization, cross-checking, and efficient coordination.
+- Prefer flexible but clear communication requirements (avoid overly brittle templates).
+- Include evaluation-oriented cues (accuracy, consistency, and turn efficiency).
+
+Prompt quality checklist:
+1. Task alignment: clearly anchor to GSM8K-style multi-step arithmetic reasoning.
+2. Structural clarity: clear sections, concise instructions, minimal ambiguity.
+3. Communication intent: encourage informative and adaptive inter-agent communication.
+4. Robustness cues: require self-checking, inconsistency handling, and error recovery.
+5. Generalization: avoid brittle, over-specified formatting that harms transfer.
+6. Length control: rich enough to guide behavior but not unnecessarily verbose.
+
+<DESIGN PRINCIPLES (PRIOR KNOWLEDGE) END>
+
+**OUTPUT ONLY THE PROMPT TEXT**: 
 """.strip()
 
     generated_prompt, generated_ids, prompt_len, log_prob = generator.generate_prompt(
@@ -170,12 +198,11 @@ OUTPUT ONLY the prompt content.
         max_new_tokens=2048,
     )
 
-    # 获取并打印峰值显存
-    if torch.cuda.is_available():
-        peak = torch.cuda.max_memory_allocated()
-        print(f"Peak GPU memory: {peak / 1024**2:.2f} MB")
-
     print("Prompt for Protocol:\n")
     print(generated_prompt)
     print(f"\nLog probability: {log_prob.item():.4f}")
     print(f"Requires grad: {log_prob.requires_grad}")
+    # 获取并打印峰值显存
+    if torch.cuda.is_available():
+        peak = torch.cuda.max_memory_allocated()
+        print(f"Peak GPU memory: {peak / 1024**2:.2f} MB")

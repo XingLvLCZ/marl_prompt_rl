@@ -7,7 +7,7 @@ from typing import Any
 class PromptGenerator:
     def __init__(
         self,
-        model_name="/root/aicloud-data/llms/Qwen3-1.7B",
+        model_name="/root/models/Qwen3-1.7B",
         adapter_path=None,
         lora_config=None,
         device_map: Any = "auto",
@@ -157,7 +157,7 @@ class PromptGenerator:
 
 
 if __name__ == "__main__":
-    generator = PromptGenerator(model_name="/root/aicloud-data/llms/Qwen3-1.7B")
+    generator = PromptGenerator(model_name="/root/models/Qwen3-1.7B")
     
     task_description = f"""
 Game:
