@@ -1,0 +1,17 @@
+torch
+transformers
+peft
+datasets
+trl
+accelerate
+
+gymnasium
+pettingzoo
+
+autogen-agentchat
+autogen-ext[openai]
+
+requests
+tqdm
+numpy
+matplotlib
