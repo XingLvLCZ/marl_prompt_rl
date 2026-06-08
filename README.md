@@ -51,5 +51,4 @@ src/
   provider/
   prompt_rl_guess/
   prompt_rl_gsm8k/
-paper/
 ```
